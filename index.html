@@ -527,6 +527,43 @@
       background:rgba(143,191,154,.06);
     }
 
+    .student-name{
+      min-width:0;
+      padding:0 6px;
+    }
+
+    .student-name strong{
+      display:block;
+      font-family:var(--serif);
+      font-size:20px;
+      font-weight:560;
+      color:#efe8d8;
+      letter-spacing:-.01em;
+    }
+
+    .student-name span{
+      display:block;
+      margin-top:3px;
+      color:var(--muted-2);
+      font-family:var(--mono);
+      font-size:9.5px;
+      text-transform:uppercase;
+      letter-spacing:.09em;
+    }
+
+    .sync-status{
+      color:var(--muted-2);
+      font-family:var(--mono);
+      font-size:10.5px;
+      letter-spacing:.03em;
+      white-space:nowrap;
+      padding-top:8px;
+    }
+
+    .sync-status.saving{color:var(--gold)}
+    .sync-status.saved{color:var(--good)}
+    .sync-status.error{color:var(--bad)}
+
     .tracker-actions{
       display:flex;
       gap:10px;
@@ -972,7 +1009,7 @@
           <h2>Marcador de alumnos</h2>
           <p>Todos deben llegar a $5,000 MXN antes de que termine el contador.</p>
         </div>
-        
+        <div class="sync-status" id="syncStatus">Conectando...</div>
       </div>
 
       <div class="students" id="students"></div>
@@ -1003,10 +1040,9 @@
 
     const studentsEl = document.getElementById("students");
     const resultEl = document.getElementById("missionResult");
-    const resetBtn = document.getElementById("resetBtn");
-    const addStudentBtn = document.getElementById("addStudentBtn");
     const checkBtn = document.getElementById("checkBtn");
     const timerStatus = document.getElementById("timerStatus");
+    const syncStatus = document.getElementById("syncStatus");
     const lessonAuthor = document.getElementById("lessonAuthor");
     const lessonText = document.getElementById("lessonText");
     const addLessonBtn = document.getElementById("addLessonBtn");
@@ -1019,10 +1055,33 @@
       seconds: document.getElementById("seconds")
     };
 
+    function safeAmount(value){
+      const n = Number(value);
+      return Number.isFinite(n) ? Math.max(0, n) : 0;
+    }
+
     function defaultStudents(){
       return [
-        { name: "Alumno 1", amount: 0 },
-        { name: "Alumno 2", amount: 0 }
+        { name: "Renata", amount: 0 },
+        { name: "Dorian", amount: 0 }
+      ];
+    }
+
+    // Migra automáticamente la fila antigua "Alumno 1 / Alumno 2"
+    // a Renata / Dorian sin perder las cantidades ya guardadas.
+    function normalizeStudents(students){
+      const list = Array.isArray(students) ? students : [];
+
+      const byName = name => list.find(student =>
+        String(student?.name || "").trim().toLowerCase() === name.toLowerCase()
+      );
+
+      const renata = byName("Renata") || list[0];
+      const dorian = byName("Dorian") || list[1];
+
+      return [
+        { name: "Renata", amount: safeAmount(renata?.amount) },
+        { name: "Dorian", amount: safeAmount(dorian?.amount) }
       ];
     }
 
@@ -1036,12 +1095,17 @@
     let lastPushedAt = null;
     let saveTimer = null;
 
+    function setSyncStatus(text, type=""){
+      syncStatus.textContent = text;
+      syncStatus.className = "sync-status" + (type ? " " + type : "");
+    }
+
     function rowToState(row){
       return {
-        startedAt: row.started_at,
-        endsAt: row.ends_at,
-        students: Array.isArray(row.students) && row.students.length ? row.students : defaultStudents(),
-        lessons: Array.isArray(row.lessons) ? row.lessons : []
+        startedAt: row?.started_at ?? null,
+        endsAt: row?.ends_at ?? null,
+        students: normalizeStudents(row?.students),
+        lessons: Array.isArray(row?.lessons) ? row.lessons : []
       };
     }
 
@@ -1050,60 +1114,89 @@
         .from("challenge_state")
         .select("*")
         .eq("id", ROW_ID)
-        .single();
+        .maybeSingle();
 
-      if(error || !data){
+      if(error){
         console.error("No se pudo cargar el estado desde Supabase", error);
+        setSyncStatus("Error al cargar", "error");
         return null;
       }
 
-      return rowToState(data);
+      return data ? rowToState(data) : null;
     }
 
     async function pushState(){
+      clearTimeout(saveTimer);
+      saveTimer = null;
+
       const ts = new Date().toISOString();
       lastPushedAt = ts;
+      setSyncStatus("Guardando...", "saving");
 
+      // upsert hace que la página también funcione si por accidente
+      // todavía no existe la fila id='main'.
       const { error } = await db
         .from("challenge_state")
-        .update({
+        .upsert({
+          id: ROW_ID,
           started_at: state.startedAt,
           ends_at: state.endsAt,
-          students: state.students,
+          students: normalizeStudents(state.students),
           lessons: state.lessons,
           updated_at: ts
-        })
-        .eq("id", ROW_ID);
+        }, { onConflict: "id" });
 
-      if(error) console.error("No se pudo guardar en Supabase", error);
+      if(error){
+        console.error("No se pudo guardar en Supabase", error);
+        setSyncStatus("No se pudo guardar", "error");
+        return false;
+      }
+
+      state.students = normalizeStudents(state.students);
+      setSyncStatus("Guardado", "saved");
+      return true;
     }
 
     function saveState(){
       clearTimeout(saveTimer);
-      saveTimer = setTimeout(pushState, 400);
+      setSyncStatus("Guardando...", "saving");
+      saveTimer = setTimeout(pushState, 450);
     }
 
     function subscribeRealtime(){
       db.channel("challenge_state_live")
         .on("postgres_changes", {
-          event: "UPDATE",
+          event: "*",
           schema: "public",
           table: "challenge_state",
           filter: `id=eq.${ROW_ID}`
         }, payload => {
           const row = payload.new;
+          if(!row) return;
           if(row.updated_at && row.updated_at === lastPushedAt) return;
+
+          const activeAmount = studentsEl.querySelector('input[data-field="amount"]:focus');
+          const activeIndex = activeAmount ? Number(activeAmount.dataset.index) : null;
+          const localTypingValue = activeAmount ? safeAmount(activeAmount.value) : null;
 
           state = rowToState(row);
 
-          const isTyping = studentsEl.contains(document.activeElement);
-          if(!isTyping) renderStudents();
+          // Si Renata o Dorian está escribiendo justo cuando llega un cambio
+          // del otro navegador, conservamos el número que todavía está tecleando.
+          if(activeIndex !== null && Number.isInteger(activeIndex) && state.students[activeIndex]){
+            state.students[activeIndex].amount = localTypingValue;
+          }else{
+            renderStudents();
+          }
 
           renderLessons();
           updateTimer();
           evaluateMission(true);
+          setSyncStatus("Sincronizado", "saved");
         })
-        .subscribe();
+        .subscribe(status => {
+          if(status === "SUBSCRIBED") setSyncStatus("Sincronizado", "saved");
+        });
     }
 
     function money(n){
@@ -1111,33 +1204,48 @@
         style:"currency",
         currency:"MXN",
         maximumFractionDigits:0
-      }).format(Number(n || 0));
+      }).format(safeAmount(n));
+    }
+
+    function updateStudentVisuals(row, amount){
+      const pct = Math.min((safeAmount(amount) / GOAL) * 100, 100);
+      const done = safeAmount(amount) >= GOAL;
+      const bar = row.querySelector(".progress > div");
+      const progress = row.querySelector(".progress");
+      const badge = row.querySelector(".badge");
+
+      bar.style.width = pct + "%";
+      progress.setAttribute("aria-label", `Progreso ${Math.round(pct)}%`);
+      badge.classList.toggle("done", done);
+      badge.textContent = done
+        ? "✓ " + money(amount)
+        : money(amount) + " / " + money(GOAL);
     }
 
     function renderStudents(){
+      state.students = normalizeStudents(state.students);
       studentsEl.innerHTML = "";
 
       state.students.forEach((student, index) => {
         const row = document.createElement("div");
         row.className = "student";
 
-        const pct = Math.min((Number(student.amount || 0) / GOAL) * 100, 100);
-        const done = Number(student.amount || 0) >= GOAL;
+        const pct = Math.min((safeAmount(student.amount) / GOAL) * 100, 100);
+        const done = safeAmount(student.amount) >= GOAL;
 
         row.innerHTML = `
-          <input
-            aria-label="Nombre del alumno"
-            value="${escapeHtml(student.name)}"
-            data-index="${index}"
-            data-field="name"
-          />
+          <div class="student-name">
+            <strong>${escapeHtml(student.name)}</strong>
+            <span>Alumno ${index + 1}</span>
+          </div>
           <div class="money-wrap">
             <input
-              aria-label="Dinero generado"
+              aria-label="Dinero generado por ${escapeHtml(student.name)}"
               type="number"
+              inputmode="decimal"
               min="0"
-              step="100"
-              value="${Number(student.amount || 0)}"
+              step="1"
+              value="${safeAmount(student.amount)}"
               data-index="${index}"
               data-field="amount"
             />
@@ -1150,26 +1258,27 @@
           </div>
         `;
 
-        studentsEl.appendChild(row);
-      });
+        const amountInput = row.querySelector('input[data-field="amount"]');
 
-      studentsEl.querySelectorAll("input").forEach(input => {
-        input.addEventListener("input", e => {
-          const index = Number(e.target.dataset.index);
-          const field = e.target.dataset.field;
-
-          if(field === "amount"){
-            state.students[index].amount = Math.max(0, Number(e.target.value || 0));
-          }else{
-            state.students[index].name = e.target.value;
-          }
-
+        amountInput.addEventListener("input", e => {
+          const amount = safeAmount(e.target.value);
+          state.students[index].amount = amount;
+          updateStudentVisuals(row, amount);
+          evaluateMission(true);
           saveState();
-
-          if(field === "amount"){
-            renderStudents();
-          }
         });
+
+        // Al terminar de editar, fuerza un guardado inmediato.
+        amountInput.addEventListener("change", async e => {
+          const amount = safeAmount(e.target.value);
+          state.students[index].amount = amount;
+          e.target.value = amount;
+          updateStudentVisuals(row, amount);
+          evaluateMission(true);
+          await pushState();
+        });
+
+        studentsEl.appendChild(row);
       });
     }
 
@@ -1182,47 +1291,37 @@
     }
 
     function evaluateMission(auto=false){
-      const allPassed = state.students.length > 0 && state.students.every(s => Number(s.amount || 0) >= GOAL);
+      const allPassed = state.students.length === 2 && state.students.every(s => safeAmount(s.amount) >= GOAL);
       const timerFinished = state.endsAt && Date.now() >= state.endsAt;
 
       resultEl.className = "mission-result";
 
       if(allPassed){
         resultEl.classList.add("success");
-        resultEl.innerHTML = `<strong>✓ Misión aprobada.</strong> Todos los alumnos generaron al menos ${money(GOAL)}.`;
+        resultEl.innerHTML = `<strong>✓ Misión aprobada.</strong> Renata y Dorian generaron al menos ${money(GOAL)} cada uno.`;
       }else if(timerFinished){
         resultEl.classList.add("fail");
-        resultEl.innerHTML = `<strong>✕ Misión fallida.</strong> Los 38 días terminaron y al menos un alumno no alcanzó ${money(GOAL)}.`;
+        resultEl.innerHTML = `<strong>✕ Misión fallida.</strong> Los 38 días terminaron y al menos uno no alcanzó ${money(GOAL)}.`;
       }else{
         const pending = state.students
-          .filter(s => Number(s.amount || 0) < GOAL)
-          .map(s => escapeHtml(s.name || "Alumno"));
+          .filter(s => safeAmount(s.amount) < GOAL)
+          .map(s => escapeHtml(s.name));
 
-        resultEl.innerHTML = `<strong>Misión en progreso.</strong> Aún falta que ${pending.join(", ")} alcance${pending.length === 1 ? "" : "n"} ${money(GOAL)}.`;
+        resultEl.innerHTML = `<strong>Misión en progreso.</strong> Aún falta que ${pending.join(" y ")} alcance${pending.length === 1 ? "" : "n"} ${money(GOAL)}.`;
       }
 
       if(!auto) saveState();
     }
 
-    async function resetChallenge(){
-      const ok = confirm("¿Quieres reiniciar el contador y todo el progreso para los dos?");
-      if(!ok) return;
-
-      const now = Date.now();
-      state = {
-        startedAt: now,
-        endsAt: now + CHALLENGE_MS,
-        students: defaultStudents(),
-        lessons: []
-      };
-
-      renderStudents();
-      updateTimer();
-      evaluateMission(true);
-      await pushState();
-    }
-
     function updateTimer(){
+      if(!state.endsAt){
+        timeEls.days.textContent = "38";
+        timeEls.hours.textContent = "00";
+        timeEls.minutes.textContent = "00";
+        timeEls.seconds.textContent = "00";
+        return;
+      }
+
       const remaining = Math.max(0, state.endsAt - Date.now());
 
       const days = Math.floor(remaining / 86400000);
@@ -1246,7 +1345,6 @@
         });
       }
     }
-
 
     function renderLessons(){
       learningList.innerHTML = "";
@@ -1288,21 +1386,11 @@
       renderLessons();
     });
 
-    addStudentBtn.addEventListener("click", () => {
-      state.students.push({
-        name: "Alumno " + (state.students.length + 1),
-        amount: 0
-      });
-      saveState();
-      renderStudents();
-      evaluateMission(true);
-    });
-
     checkBtn.addEventListener("click", () => evaluateMission(false));
-    resetBtn.addEventListener("click", resetChallenge);
 
     async function init(){
       timerStatus.textContent = "Cargando...";
+      setSyncStatus("Conectando...");
 
       const remote = await fetchState();
       if(remote) state = remote;
@@ -1311,8 +1399,11 @@
         const now = Date.now();
         state.startedAt = now;
         state.endsAt = now + CHALLENGE_MS;
-        await pushState();
       }
+
+      // Guarda también la migración de Alumno 1/2 -> Renata/Dorian.
+      state.students = normalizeStudents(state.students);
+      await pushState();
 
       renderStudents();
       renderLessons();
